@@ -1,0 +1,2 @@
+# This file intentionally left blank to trigger DB recreation.
+# Delete water_intake.db manually if schema errors occur.
