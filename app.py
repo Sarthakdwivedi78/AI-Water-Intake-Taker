@@ -12,7 +12,33 @@ _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
 # ── Database setup ────────────────────────────────────────────────────────────
-DB_PATH = Path("/tmp/water_intake.db") if os.path.exists("/tmp") else Path(__file__).parent / "water_intake.db"
+# Always store the DB next to app.py so data survives reboots
+DB_PATH    = Path(__file__).parent / "water_intake.db"
+SESSION_FILE = Path(__file__).parent / ".last_user.json"
+
+
+def save_last_user(user_id: str):
+    """Persist the logged-in user to disk so it survives app restarts."""
+    import json
+    SESSION_FILE.write_text(json.dumps({"user_id": user_id}))
+
+
+def load_last_user() -> str:
+    """Return the last logged-in user_id, or empty string if none saved."""
+    import json
+    try:
+        if SESSION_FILE.exists():
+            data = json.loads(SESSION_FILE.read_text())
+            return data.get("user_id", "")
+    except Exception:
+        pass
+    return ""
+
+
+def clear_last_user():
+    """Remove the persisted session on logout."""
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
 
 # IST timezone offset
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -96,6 +122,23 @@ def get_entries_for_date(user_id: str, log_date: str) -> list:
     ).fetchall()
     conn.close()
     return [{"id": r[0], "amount_ml": int(r[1]), "logged_at": r[2]} for r in rows]
+
+
+def log_water_for_date(user_id: str, amount: int, log_date: str, log_time: str) -> int:
+    """Log water for any past date with a custom time."""
+    logged_at = f"{log_date} {log_time}:00"
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO water_logs (user_id, amount_ml, logged_at, log_date) VALUES (?,?,?,?)",
+        (user_id, amount, logged_at, log_date),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT SUM(amount_ml) FROM water_logs WHERE user_id=? AND log_date=?",
+        (user_id, log_date),
+    ).fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] else 0
 
 
 def update_entry(entry_id: int, new_amount: int):
@@ -195,16 +238,23 @@ def get_ai_feedback(user_id, amount_ml, total_today_ml, daily_target_ml):
 st.set_page_config(page_title="💧 AI Water Tracker", page_icon="💧", layout="wide")
 
 # ── Session state defaults ────────────────────────────────────────────────────
+# Auto-restore the last logged-in user from disk on first load
+_saved_user = load_last_user()
 for key, val in [
-    ("logged_in", False),
-    ("active_user", ""),
+    ("logged_in",   bool(_saved_user)),
+    ("active_user", _saved_user),
     ("daily_target", 2000),
     ("water_amount", 250),
-    ("last_log", None),
-    ("editing_id", None),
+    ("last_log",    None),
+    ("editing_id",  None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = val
+
+# If auto-restored, load the saved user's target
+if st.session_state.logged_in and st.session_state.active_user:
+    if st.session_state.daily_target == 2000:   # only on first load
+        st.session_state.daily_target = get_user_target(st.session_state.active_user)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -227,6 +277,7 @@ with st.sidebar:
             st.session_state.active_user  = uid
             st.session_state.daily_target = get_user_target(uid)
             st.session_state.last_log     = None
+            save_last_user(uid)            # ← persist to disk
             st.success(f"Welcome, **{uid}**! 👋")
             st.rerun()
 
@@ -236,6 +287,7 @@ with st.sidebar:
             st.session_state.logged_in   = False
             st.session_state.active_user = ""
             st.session_state.last_log    = None
+            clear_last_user()             # ← remove from disk
             st.rerun()
 
     if st.session_state.logged_in:
@@ -287,9 +339,38 @@ with st.sidebar:
 
         st.markdown("")
         submit = st.button("Submit", use_container_width=True, type="primary")
+
+        # ── Log for a Past Date ───────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📆 Log for a Past Date")
+        st.caption("Forgot to log? Add an entry for any previous day.")
+
+        max_past_date = (datetime.now(IST) - timedelta(days=1)).date()
+        past_log_date = st.date_input(
+            "Select date",
+            value=max_past_date,
+            max_value=max_past_date,
+            key="past_log_date",
+        )
+
+        past_log_time = st.time_input(
+            "Time of drinking",
+            value=datetime.strptime("08:00", "%H:%M").time(),
+            key="past_log_time",
+        )
+
+        past_amount = st.number_input(
+            "Amount (ml)",
+            min_value=50, max_value=5000,
+            value=250, step=50,
+            key="past_log_amount",
+        )
+
+        submit_past = st.button("➕ Add Past Entry", use_container_width=True, type="secondary")
     else:
-        submit = False
-        user_id = ""
+        submit      = False
+        submit_past = False
+        user_id     = ""
 
 
 # ── Main dashboard ────────────────────────────────────────────────────────────
@@ -331,6 +412,15 @@ if submit:
         except Exception as e:
             st.error(f"❌ Error: {e}")
             st.stop()
+
+# ── Handle past-date submit ─────────────────────────────────────────────────
+if submit_past:
+    date_str = str(past_log_date)
+    time_str = past_log_time.strftime("%H:%M")
+    total_for_date = log_water_for_date(user_id, int(past_amount), date_str, time_str)
+    friendly = past_log_date.strftime("%d %b %Y")
+    st.success(f"✅ Added **{past_amount} ml** at **{past_log_time.strftime('%I:%M %p')}** on **{friendly}** (day total: {total_for_date} ml)")
+    st.rerun()
 
 # ── Show last log result ───────────────────────────────────────────────────────
 if st.session_state.last_log:
@@ -483,25 +573,24 @@ if history:
         )
         selected_date = date_map[selected_friendly]
 
-        with st.expander(f"📋 Entries for {selected_friendly}", expanded=True):
+        with st.expander(f"📋 Entries for {selected_friendly}", expanded=False):
             render_entries(user_id, selected_date, is_today=False)
 
     # ── Charts ────────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 📊 Charts")
+    with st.expander("📊 Show Charts", expanded=False):
+        all_df = pd.DataFrame(history)
+        all_df.columns = ["Date", "Water Intake (ml)"]
+        all_df["Date"] = pd.to_datetime(all_df["Date"])
+        all_df = all_df.sort_values("Date")
 
-    all_df = pd.DataFrame(history)
-    all_df.columns = ["Date", "Water Intake (ml)"]
-    all_df["Date"] = pd.to_datetime(all_df["Date"])
-    all_df = all_df.sort_values("Date")
+        chart_df = all_df.set_index("Date")[["Water Intake (ml)"]].copy()
+        chart_df["Daily Target (ml)"] = target_for_chart
+        st.markdown("**Daily Intake vs Target**")
+        st.line_chart(chart_df)
 
-    chart_df = all_df.set_index("Date")[["Water Intake (ml)"]].copy()
-    chart_df["Daily Target (ml)"] = target_for_chart
-    st.markdown("**Daily Intake vs Target**")
-    st.line_chart(chart_df)
-
-    st.markdown("**Daily Intake Bar Chart**")
-    st.bar_chart(all_df.set_index("Date")["Water Intake (ml)"])
+        st.markdown("**Daily Intake Bar Chart**")
+        st.bar_chart(all_df.set_index("Date")["Water Intake (ml)"])
 
     # ── Summary stats ─────────────────────────────────────────────────────────
     st.markdown("---")
