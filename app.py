@@ -2,7 +2,7 @@ import os
 import sqlite3
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -13,6 +13,9 @@ load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
 # ── Database setup ────────────────────────────────────────────────────────────
 DB_PATH = Path("/tmp/water_intake.db") if os.path.exists("/tmp") else Path(__file__).parent / "water_intake.db"
+
+# IST timezone offset
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _conn():
@@ -41,8 +44,9 @@ def init_db():
 
 
 def log_water(user_id: str, amount: int) -> int:
-    today = str(date.today())
-    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_ist = datetime.now(IST)
+    today   = now_ist.strftime("%Y-%m-%d")
+    now     = now_ist.strftime("%Y-%m-%d %H:%M:%S")
     conn  = _conn()
     conn.execute(
         "INSERT INTO water_logs (user_id, amount_ml, logged_at, log_date) VALUES (?,?,?,?)",
@@ -58,7 +62,7 @@ def log_water(user_id: str, amount: int) -> int:
 
 
 def get_today_total(user_id: str) -> int:
-    today = str(date.today())
+    today = datetime.now(IST).strftime("%Y-%m-%d")
     conn  = _conn()
     row   = conn.execute(
         "SELECT SUM(amount_ml) FROM water_logs WHERE user_id=? AND log_date=?",
@@ -78,6 +82,34 @@ def get_history(user_id: str) -> list:
     ).fetchall()
     conn.close()
     return [{"date": r[0], "total_ml": int(r[1])} for r in rows]
+
+
+def get_entries_for_date(user_id: str, log_date: str) -> list:
+    """Return all individual entries for a given date, newest first."""
+    conn = _conn()
+    rows = conn.execute(
+        """SELECT id, amount_ml, logged_at
+           FROM water_logs
+           WHERE user_id=? AND log_date=?
+           ORDER BY logged_at ASC""",
+        (user_id, log_date),
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "amount_ml": int(r[1]), "logged_at": r[2]} for r in rows]
+
+
+def update_entry(entry_id: int, new_amount: int):
+    conn = _conn()
+    conn.execute("UPDATE water_logs SET amount_ml=? WHERE id=?", (new_amount, entry_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_entry(entry_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM water_logs WHERE id=?", (entry_id,))
+    conn.commit()
+    conn.close()
 
 
 def get_user_target(user_id: str) -> int:
@@ -112,7 +144,6 @@ def get_llm():
     if _llm:
         return _llm
 
-    # 1. Try Streamlit secrets (Streamlit Cloud)
     api_key = ""
     model   = "mixtral-8x7b-32768"
     try:
@@ -121,7 +152,6 @@ def get_llm():
     except Exception:
         pass
 
-    # 2. Fall back to environment variables / .env (local)
     if not api_key:
         api_key = os.getenv("GROQ_API_KEY", "")
     if not model:
@@ -171,6 +201,7 @@ for key, val in [
     ("daily_target", 2000),
     ("water_amount", 250),
     ("last_log", None),
+    ("editing_id", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = val
@@ -275,6 +306,7 @@ Please **enter your User ID** in the sidebar and click **🔐 Login** to get sta
 - 🎯 Set a personal daily hydration target
 - 🤖 Get AI-powered health feedback after each log
 - 📈 View your intake history and progress charts
+- ✏️ Edit or delete any past entry
     """)
     st.stop()
 
@@ -339,43 +371,151 @@ if st.session_state.last_log:
 
     st.markdown("---")
 
+
+# ── Helper: render entries table for a date (with edit / delete) ──────────────
+def render_entries(user_id: str, log_date: str, is_today: bool):
+    entries = get_entries_for_date(user_id, log_date)
+    if not entries:
+        st.caption("No entries found.")
+        return
+
+    for idx, entry in enumerate(entries):
+        eid      = entry["id"]
+        amount   = entry["amount_ml"]
+        # Show only the time portion from logged_at
+        try:
+            time_str = datetime.strptime(entry["logged_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
+        except Exception:
+            time_str = entry["logged_at"]
+
+        col_time, col_amt, col_edit, col_del = st.columns([2, 2, 1, 1])
+        col_time.markdown(f"🕐 **{time_str}**")
+        col_amt.markdown(f"💧 **{amount} ml**")
+
+        # ── Edit button / inline form ─────────────────────────────────────────
+        edit_key = f"editing_{eid}"
+        if edit_key not in st.session_state:
+            st.session_state[edit_key] = False
+
+        if col_edit.button("✏️", key=f"edit_btn_{eid}", help="Edit this entry"):
+            st.session_state[edit_key] = not st.session_state[edit_key]
+
+        if col_del.button("🗑️", key=f"del_btn_{eid}", help="Delete this entry"):
+            delete_entry(eid)
+            st.session_state.last_log = None
+            st.rerun()
+
+        if st.session_state[edit_key]:
+            with st.form(key=f"edit_form_{eid}"):
+                new_val = st.number_input(
+                    f"New amount for entry logged at {time_str}",
+                    min_value=50, max_value=5000,
+                    value=amount, step=50,
+                )
+                save_col, cancel_col = st.columns(2)
+                saved    = save_col.form_submit_button("💾 Save",   use_container_width=True, type="primary")
+                cancelled = cancel_col.form_submit_button("✖ Cancel", use_container_width=True)
+
+            if saved:
+                update_entry(eid, int(new_val))
+                st.session_state[edit_key] = False
+                st.session_state.last_log  = None
+                st.rerun()
+            if cancelled:
+                st.session_state[edit_key] = False
+                st.rerun()
+
+    # Total row
+    total = sum(e["amount_ml"] for e in entries)
+    st.markdown(f"**Total: {total} ml**")
+
+
 # ── History section ───────────────────────────────────────────────────────────
 st.subheader("📈 Water Intake History")
 
-history = get_history(user_id)
+history          = get_history(user_id)
 target_for_chart = get_user_target(user_id)
+today_str        = datetime.now(IST).strftime("%Y-%m-%d")
 
 if history:
-    df = pd.DataFrame(history)
-    df.columns = ["Date", "Water Intake (ml)"]
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date")
-    df["Goal Met?"] = df["Water Intake (ml)"].apply(
-        lambda x: "✅ Yes" if x >= target_for_chart else "❌ No"
-    )
+    # ── TODAY section (if there are entries for today) ────────────────────────
+    today_history = [h for h in history if h["date"] == today_str]
+    if today_history:
+        st.markdown("### 🗓️ Today's Entries")
+        st.caption("All entries logged today — you can edit or delete any of them.")
+        render_entries(user_id, today_str, is_today=True)
+        st.markdown("---")
 
-    st.dataframe(df.reset_index(drop=True), use_container_width=True)
+    # ── PAST DAYS summary table ───────────────────────────────────────────────
+    past_history = [h for h in history if h["date"] != today_str]
+    if past_history:
+        st.markdown("### 📅 Past Days")
+        st.caption("Shows daily totals. Expand any day to see individual entries and edit/delete them.")
 
-    st.markdown("**Daily Intake vs Target**")
-    chart_df = df.set_index("Date")[["Water Intake (ml)"]].copy()
+        df = pd.DataFrame(past_history)
+        df.columns = ["Date", "Total (ml)"]
+        df["Date"]     = pd.to_datetime(df["Date"])
+        df             = df.sort_values("Date", ascending=False)
+        df["Goal Met?"] = df["Total (ml)"].apply(
+            lambda x: "✅ Yes" if x >= target_for_chart else "❌ No"
+        )
+        df["Date"] = df["Date"].dt.strftime("%d %b %Y")
+
+        # Summary table (no individual times)
+        st.dataframe(
+            df[["Date", "Total (ml)", "Goal Met?"]].reset_index(drop=True),
+            use_container_width=True,
+        )
+
+        st.markdown("#### 🔍 View / Edit Entries for a Past Day")
+        past_dates = sorted(
+            [h["date"] for h in past_history], reverse=True
+        )
+        friendly_dates = [
+            datetime.strptime(d, "%Y-%m-%d").strftime("%d %b %Y") for d in past_dates
+        ]
+        date_map = dict(zip(friendly_dates, past_dates))
+
+        selected_friendly = st.selectbox(
+            "Pick a day to inspect:",
+            options=friendly_dates,
+            index=0,
+        )
+        selected_date = date_map[selected_friendly]
+
+        with st.expander(f"📋 Entries for {selected_friendly}", expanded=True):
+            render_entries(user_id, selected_date, is_today=False)
+
+    # ── Charts ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📊 Charts")
+
+    all_df = pd.DataFrame(history)
+    all_df.columns = ["Date", "Water Intake (ml)"]
+    all_df["Date"] = pd.to_datetime(all_df["Date"])
+    all_df = all_df.sort_values("Date")
+
+    chart_df = all_df.set_index("Date")[["Water Intake (ml)"]].copy()
     chart_df["Daily Target (ml)"] = target_for_chart
+    st.markdown("**Daily Intake vs Target**")
     st.line_chart(chart_df)
 
     st.markdown("**Daily Intake Bar Chart**")
-    st.bar_chart(df.set_index("Date")["Water Intake (ml)"])
+    st.bar_chart(all_df.set_index("Date")["Water Intake (ml)"])
 
+    # ── Summary stats ─────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("**📊 Summary Statistics**")
-    avg        = int(df["Water Intake (ml)"].mean())
-    best       = int(df["Water Intake (ml)"].max())
-    days_met   = int((df["Water Intake (ml)"] >= target_for_chart).sum())
-    total_days = len(df)
+    avg        = int(all_df["Water Intake (ml)"].mean())
+    best       = int(all_df["Water Intake (ml)"].max())
+    days_met   = int((all_df["Water Intake (ml)"] >= target_for_chart).sum())
+    total_days = len(all_df)
 
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("📅 Days Tracked",    total_days)
-    s2.metric("💧 Avg Daily Intake", f"{avg} ml",
+    s1.metric("📅 Days Tracked",     total_days)
+    s2.metric("💧 Avg Daily Intake",  f"{avg} ml",
               delta=f"{avg - target_for_chart:+d} ml vs target")
-    s3.metric("🏆 Best Day",         f"{best} ml")
-    s4.metric("✅ Goal Hit",         f"{days_met}/{total_days} days")
+    s3.metric("🏆 Best Day",          f"{best} ml")
+    s4.metric("✅ Goal Hit",          f"{days_met}/{total_days} days")
 else:
     st.info("No history yet. Log your first water intake using the sidebar!")
